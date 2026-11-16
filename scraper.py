@@ -14,10 +14,14 @@ import xml.etree.ElementTree as ET
 
 import instaloader
 
+# ==========================================
+# KONFIGURASI
+# ==========================================
 TARGET_USERNAME = os.getenv("IG_USERNAME", "pa.sanggau")
 MAX_POSTS = int(os.getenv("MAX_POSTS", "20"))
 OUTPUT_FILE = os.getenv("OUTPUT_FILE", "rss.xml")
 SESSION_ID = os.getenv("IG_SESSIONID", "").strip()
+DS_USER_ID = os.getenv("IG_DS_USER_ID", "").strip()
 USER_AGENT = os.getenv(
     "USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -40,14 +44,17 @@ def sanitize_cdata(text: str) -> str:
 def generate_title(caption: str, shortcode: str) -> str:
     if not caption or not caption.strip():
         return f"Postingan Baru Instagram @{TARGET_USERNAME} ({shortcode})"
+
     clean_text = " ".join(caption.strip().split())
     if len(clean_text) <= 50:
         return clean_text
+    
     return clean_text[:47].rstrip() + "..."
 
 
 def format_description_html(caption: str, image_url: str, post_link: str) -> str:
     html_parts = ['<div style="font-family: -apple-system, BlinkMacSystemFont, \'Segoe UI\', Roboto, sans-serif; line-height: 1.6;">']
+
     if image_url:
         html_parts.append(
             f'<p><a href="{html.escape(post_link)}" target="_blank" rel="noopener noreferrer">'
@@ -74,6 +81,7 @@ def format_description_html(caption: str, image_url: str, post_link: str) -> str
         f'Lihat postingan asli di Instagram &rarr;</a></small></p>'
     )
     html_parts.append('</div>')
+
     return "\n".join(html_parts)
 
 
@@ -115,11 +123,52 @@ def build_rss_xml(posts: list, channel_title: str, channel_desc: str) -> str:
 
     xml_lines.append('  </channel>')
     xml_lines.append('</rss>\n')
+
     return "\n".join(xml_lines)
 
 
+def parse_post_node(node: dict) -> dict:
+    code = node.get("code") or node.get("shortcode")
+    link = f"https://www.instagram.com/p/{code}/"
+    
+    caption_obj = node.get("caption")
+    if isinstance(caption_obj, dict):
+        caption = caption_obj.get("text", "")
+    elif isinstance(caption_obj, str):
+        caption = caption_obj
+    else:
+        caption = ""
+
+    # Konversi ID Snowflake Instagram ke waktu publikasi akurat
+    pk = node.get("pk")
+    if pk:
+        ts = ((int(pk) >> 23) + 1314220021794) / 1000.0
+        post_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    elif node.get("taken_at_timestamp"):
+        post_dt = datetime.fromtimestamp(node["taken_at_timestamp"], tz=timezone.utc)
+    else:
+        post_dt = datetime.now(timezone.utc)
+
+    pub_date = post_dt.strftime("%a, %d %b %Y %H:%M:%S GMT")
+    image_url = node.get("display_uri") or node.get("display_url") or ""
+
+    title = generate_title(caption, code)
+    desc_html = format_description_html(caption, image_url, link)
+
+    return {
+        "shortcode": code,
+        "title": title,
+        "link": link,
+        "guid": link,
+        "pub_date": pub_date,
+        "image_url": image_url,
+        "description_html": desc_html,
+    }
+
+
 def fetch_instagram_posts(username: str, limit: int) -> tuple[list, str, str]:
-    logger.info(f"Menginisialisasi Instaloader untuk akun @{username}...")
+    logger.info(f"Menginisialisasi loader untuk profil @{username}...")
+    
     loader = instaloader.Instaloader(
         download_pictures=False,
         download_videos=False,
@@ -132,53 +181,107 @@ def fetch_instagram_posts(username: str, limit: int) -> tuple[list, str, str]:
         quiet=True
     )
 
-    # Injeksi cookie session agar tembus blokir cloud data center
+    # Injeksi cookie ke sesi HTTP
     if SESSION_ID:
-        logger.info("Session cookie terdeteksi. Memuat sesi login Instagram...")
-        loader.context._session.cookies.set("sessionid", SESSION_ID, domain=".instagram.com")
+        logger.info("Session cookie terdeteksi. Memasang cookie ke sesi HTTP...")
+        if "=" in SESSION_ID:
+            for part in SESSION_ID.split(";"):
+                if "=" in part:
+                    k, v = part.strip().split("=", 1)
+                    k_clean = k.strip()
+                    v_clean = v.strip().strip('"')
+                    loader.context._session.cookies.set(k_clean, v_clean, domain=".instagram.com")
+                    loader.context._session.cookies.set(k_clean, v_clean, domain="www.instagram.com")
+        else:
+            for domain in [".instagram.com", "www.instagram.com", ""]:
+                kwargs = {"domain": domain} if domain else {}
+                loader.context._session.cookies.set("sessionid", SESSION_ID, **kwargs)
+                if DS_USER_ID:
+                    loader.context._session.cookies.set("ds_user_id", DS_USER_ID, **kwargs)
+
+        loader.context._session.headers.update({
+            "x-ig-app-id": "936619743392459",
+            "Referer": "https://www.instagram.com/",
+        })
     else:
         logger.info("Berjalan tanpa session cookie.")
 
-    logger.info(f"Mengunduh informasi profil @{username}...")
-    profile = instaloader.Profile.from_username(loader.context, username)
-    channel_title = f"{profile.full_name or username} (@{username}) - Instagram"
-    channel_desc = profile.biography or f"Feed RSS postingan publik Instagram @{username}"
+    # KUNCI UTAMA: Cegah Instaloader menghapus cookie session saat memanggil get_page_data
+    loader.context.get_anonymous_session = lambda: loader.context._session
+
+    logger.info(f"Mengambil halaman web profil publik @{username}...")
+    page_data = loader.context.get_page_data(f"{username.lower()}/")
+
+    channel_title = f"Pengadilan Agama Sanggau (@{username}) - Instagram"
+    channel_desc = f"Feed RSS postingan publik Instagram @{username}"
+
+    embedded_edges = []
+    for data in page_data:
+        if "xig_user_by_username" in data:
+            u_info = data["xig_user_by_username"]
+            if u_info.get("full_name"):
+                channel_title = f"{u_info.get('full_name')} (@{username}) - Instagram"
+            if u_info.get("biography"):
+                channel_desc = u_info.get("biography")
+            
+            timeline = u_info.get("polaris_ordered_timeline_connection")
+            if timeline and "edges" in timeline:
+                embedded_edges.extend(timeline["edges"])
 
     posts_data = []
-    for post in profile.get_posts():
-        shortcode = post.shortcode
-        link = f"https://www.instagram.com/p/{shortcode}/"
-        caption = post.caption or ""
-        post_dt = post.date_utc.replace(tzinfo=timezone.utc)
-        pub_date = post_dt.strftime("%a, %d %b %Y %H:%M:%S GMT")
-        image_url = post.url or ""
-        title = generate_title(caption, shortcode)
-        desc_html = format_description_html(caption, image_url, link)
+    for edge in embedded_edges:
+        node = edge.get("node", {})
+        if node:
+            posts_data.append(parse_post_node(node))
+            if len(posts_data) >= limit:
+                break
 
-        posts_data.append({
-            "shortcode": shortcode,
-            "title": title,
-            "link": link,
-            "guid": link,
-            "pub_date": pub_date,
-            "image_url": image_url,
-            "description_html": desc_html,
-        })
-        if len(posts_data) >= limit:
-            break
+    logger.info(f"Berhasil mengekstrak {len(posts_data)} postingan terbaru dari profil @{username}.")
+
+    # Jika limit lebih besar dan didukung, coba ambil postingan arsip tambahan
+    if len(posts_data) < limit:
+        try:
+            logger.info("Mencoba mengambil postingan arsip tambahan...")
+            profile = instaloader.Profile.from_username(loader.context, username)
+            for p in profile.get_posts():
+                if any(item["shortcode"] == p.shortcode for item in posts_data):
+                    continue
+                
+                p_dt = p.date_utc.replace(tzinfo=timezone.utc)
+                posts_data.append({
+                    "shortcode": p.shortcode,
+                    "title": generate_title(p.caption or "", p.shortcode),
+                    "link": f"https://www.instagram.com/p/{p.shortcode}/",
+                    "guid": f"https://www.instagram.com/p/{p.shortcode}/",
+                    "pub_date": p_dt.strftime("%a, %d %b %Y %H:%M:%S GMT"),
+                    "image_url": p.url or "",
+                    "description_html": format_description_html(p.caption or "", p.url or "", f"https://www.instagram.com/p/{p.shortcode}/"),
+                })
+                if len(posts_data) >= limit:
+                    break
+        except Exception as more_err:
+            logger.warning(f"Arsip lanjutan tidak dapat dimuat ({more_err}), menggunakan {len(posts_data)} postingan utama.")
 
     return posts_data, channel_title, channel_desc
 
 
 def main():
     logger.info("=== Memulai Eksekusi Instagram RSS Scraper ===")
+    
     try:
         posts, ch_title, ch_desc = fetch_instagram_posts(TARGET_USERNAME, MAX_POSTS)
+        
         if not posts:
-            raise ValueError(f"Tidak ada postingan ditemukan.")
+            raise ValueError(f"Tidak ada postingan yang ditemukan untuk profil @{TARGET_USERNAME}.")
 
+        logger.info("Menyusun format dokumen RSS 2.0...")
         rss_xml_content = build_rss_xml(posts, ch_title, ch_desc)
-        ET.fromstring(rss_xml_content)
+
+        try:
+            ET.fromstring(rss_xml_content)
+            logger.info("Validasi sintaks XML berhasil: Well-formed RSS 2.0.")
+        except ET.ParseError as pe:
+            raise RuntimeError(f"Gagal memvalidasi XML yang dihasilkan: {pe}")
 
         temp_dir = os.path.dirname(os.path.abspath(OUTPUT_FILE))
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=temp_dir, delete=False) as tf:
@@ -187,13 +290,17 @@ def main():
 
         os.replace(temp_name, OUTPUT_FILE)
         logger.info(f"File RSS berhasil disimpan ke: '{OUTPUT_FILE}' ({len(posts)} postingan).")
-        logger.info("=== Selesai dengan Sukses ===")
+        logger.info("=== Eksekusi Selesai dengan Sukses ===")
+
     except Exception as exc:
         logger.error(f"Terjadi kendala saat memproses data Instagram: {exc}", exc_info=True)
         if os.path.exists(OUTPUT_FILE):
-            logger.warning(f"File '{OUTPUT_FILE}' lama tetap dipertahankan.")
+            logger.warning(
+                f"File '{OUTPUT_FILE}' yang sudah ada dipertahankan agar feed tidak hilang."
+            )
             sys.exit(0)
         else:
+            logger.error(f"File '{OUTPUT_FILE}' belum ada dan proses scraping gagal. Berhenti.")
             sys.exit(1)
 
 
