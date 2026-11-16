@@ -2,12 +2,9 @@ name: Update Instagram RSS Feed
 
 on:
   schedule:
-    # Menjalankan otomatis setiap 3 jam sekali
     - cron: '0 */3 * * *'
-  # Mendukung tombol manual "Run workflow" di tab Actions
   workflow_dispatch:
 
-# Memberikan izin menulis (write) untuk push commit hasil scrape ke repository
 permissions:
   contents: write
 
@@ -36,16 +33,15 @@ jobs:
           IG_USERNAME: 'pa.sanggau'
           MAX_POSTS: '20'
           OUTPUT_FILE: 'rss.xml'
+          IG_SESSIONID: ${{ secrets.IG_SESSIONID }}
         run: |
           python scraper.py
 
       - name: Commit and Push Changes
         run: |
-          # Konfigurasi identitas Git bot GitHub Actions
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Cek apakah ada perubahan pada rss.xml
           if git status --porcelain | grep -q "rss.xml"; then
             echo "Perubahan ditemukan pada rss.xml. Memproses commit..."
             git add rss.xml
