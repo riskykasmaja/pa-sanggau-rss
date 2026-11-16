@@ -1,0 +1,57 @@
+name: Update Instagram RSS Feed
+
+on:
+  schedule:
+    # Menjalankan otomatis setiap 3 jam sekali
+    - cron: '0 */3 * * *'
+  # Mendukung tombol manual "Run workflow" di tab Actions
+  workflow_dispatch:
+
+# Memberikan izin menulis (write) untuk push commit hasil scrape ke repository
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Scrape Instagram & Update RSS
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python Environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Scraper
+        env:
+          IG_USERNAME: 'pa.sanggau'
+          MAX_POSTS: '20'
+          OUTPUT_FILE: 'rss.xml'
+        run: |
+          python scraper.py
+
+      - name: Commit and Push Changes
+        run: |
+          # Konfigurasi identitas Git bot GitHub Actions
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Cek apakah ada perubahan pada rss.xml
+          if git status --porcelain | grep -q "rss.xml"; then
+            echo "Perubahan ditemukan pada rss.xml. Memproses commit..."
+            git add rss.xml
+            git commit -m "Auto-update Instagram RSS [skip ci]"
+            git push
+            echo "Pembaruan rss.xml berhasil di-push ke repository."
+          else
+            echo "Tidak ada postingan baru. rss.xml tetap sama."
+          fi
