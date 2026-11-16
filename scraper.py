@@ -94,13 +94,81 @@ def format_description_html(caption: str, image_url: str, post_link: str) -> str
     return "\n".join(html_parts)
 
 
+def bersihkan_url(url) -> str:
+    """Menormalkan URL CDN menjadi https polos tanpa entitas HTML."""
+    if not isinstance(url, str) or not url:
+        return ""
+    url = html.unescape(url).strip().replace("\\/", "/")
+    if url.startswith("//"):
+        url = "https:" + url
+    elif url.startswith("http://"):
+        url = "https://" + url[len("http://"):]
+    if not url.startswith("https://"):
+        return ""
+    return url.replace(" ", "%20")
+
+
+def pilih_gambar_node(node: dict) -> str:
+    """Mengambil URL foto terbaik dari berbagai bentuk node Instagram.
+
+    Instagram mengirim JSON dalam beberapa bentuk: GraphQL lama (`display_url`),
+    API media baru (`image_versions2.candidates`), dan carousel. Tanpa pencarian
+    bertingkat, node generasi baru selalu kosong sehingga feed tanpa foto.
+    """
+    kandidat = []
+    for kunci in ("display_url", "display_uri", "thumbnail_src", "thumbnail_url"):
+        nilai = node.get(kunci)
+        if isinstance(nilai, str) and nilai:
+            kandidat.append(nilai)
+
+    versi = node.get("image_versions2")
+    if isinstance(versi, dict):
+        for calon in versi.get("candidates") or []:
+            if isinstance(calon, dict) and isinstance(calon.get("url"), str):
+                kandidat.append(calon["url"])
+
+    carousel = node.get("edge_sidecar_to_children") or node.get("carousel_media")
+    if isinstance(carousel, dict):
+        for anak in carousel.get("edges") or []:
+            if isinstance(anak, dict) and isinstance(anak.get("node"), dict):
+                kandidat.append(pilih_gambar_node(anak["node"]))
+    elif isinstance(carousel, list):
+        for anak in carousel:
+            if isinstance(anak, dict):
+                kandidat.append(pilih_gambar_node(anak))
+
+    for url in kandidat:
+        bersih = bersihkan_url(url)
+        if bersih:
+            return bersih
+    return ""
+
+
+def ambil_gambar_embed(loader, code: str) -> str:
+    """Cadangan terakhir: membaca foto dari halaman embed publik sebuah postingan.
+
+    Endpoint /p/<code>/embed/captioned/ umumnya tetap terbuka walau halaman profil
+    memblokir klien tanpa login, sehingga butir tanpa foto masih dapat diselamatkan.
+    """
+    try:
+        halaman = loader.context._get_page(loader.context._session, f"p/{code}/embed/captioned/")
+    except Exception as galat:
+        logger.warning(f"Halaman embed {code} tidak dapat dibuka: {galat}")
+        return ""
+
+    cocok = re.search(r'class="EmbeddedMediaImage"[^>]*src="([^"]+)"', halaman)
+    if not cocok:
+        cocok = re.search(r'"display_url"\s*:\s*"([^"]+)"', halaman)
+    return bersihkan_url(cocok.group(1)) if cocok else ""
+
+
 def build_rss_xml(posts: list, channel_title: str, channel_desc: str) -> str:
     now_rfc822 = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
     profile_url = f"https://www.instagram.com/{TARGET_USERNAME}/"
 
     xml_lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
-        '<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">',
+        '<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:media="http://search.yahoo.com/mrss/">',
         '  <channel>',
         f'    <title>{html.escape(channel_title)}</title>',
         f'    <link>{html.escape(profile_url)}</link>',
@@ -127,6 +195,8 @@ def build_rss_xml(posts: list, channel_title: str, channel_desc: str) -> str:
         if post.get("image_url"):
             enclosure_url = html.escape(post["image_url"])
             xml_lines.append(f'      <enclosure url="{enclosure_url}" length="0" type="image/jpeg" />')
+            xml_lines.append(f'      <media:thumbnail url="{enclosure_url}" />')
+            xml_lines.append(f'      <media:content url="{enclosure_url}" medium="image" />')
 
         xml_lines.append('    </item>')
 
@@ -137,7 +207,10 @@ def build_rss_xml(posts: list, channel_title: str, channel_desc: str) -> str:
 
 
 def parse_post_node(node: dict) -> dict:
-    code = node.get("code") or node.get("shortcode")
+    code = node.get("code") or node.get("shortcode") or ""
+    if not code:
+        return {}
+
     link = f"https://www.instagram.com/p/{code}/"
     
     caption_obj = node.get("caption")
@@ -163,23 +236,23 @@ def parse_post_node(node: dict) -> dict:
         post_dt = datetime.now(timezone.utc)
 
     pub_date = post_dt.strftime("%a, %d %b %Y %H:%M:%S GMT")
-    image_url = node.get("display_uri") or node.get("display_url") or ""
+    image_url = pilih_gambar_node(node)
 
-    title = generate_title(caption, code)
-    desc_html = format_description_html(caption, image_url, link)
+    caption_akhir = caption or ""
 
     return {
         "shortcode": code,
-        "title": title,
+        "caption": caption_akhir,
+        "title": generate_title(caption_akhir, code),
         "link": link,
         "guid": link,
         "pub_date": pub_date,
         "image_url": image_url,
-        "description_html": desc_html,
+        "description_html": format_description_html(caption_akhir, image_url, link),
     }
 
 
-def universal_extract_posts(html_text: str) -> tuple[dict, list]:
+def universal_extract_posts(html_text: str, username: str) -> tuple[dict, list]:
     """
     Ekstraksi rekursif universal dari seluruh script JSON di dalam HTML Instagram.
     Mendukung format xdt_user_by_username, xig_user_by_username, polaris, maupun edge_owner.
@@ -194,10 +267,13 @@ def universal_extract_posts(html_text: str) -> tuple[dict, list]:
         nonlocal user_info, edges
         if isinstance(obj, dict):
             # 1. Cari data profil user
-            for u_key in ["xdt_user_by_username", "xig_user_by_username", "user"]:
+            for u_key in ["xdt_user_by_username", "xig_user_by_username"]:
                 if u_key in obj and isinstance(obj[u_key], dict):
                     cand = obj[u_key]
-                    if cand.get("full_name") or cand.get("biography") or cand.get("pk"):
+                    nama = str(cand.get("username", "")).lower()
+                    if nama == username.lower() and (
+                        cand.get("full_name") or cand.get("biography") or cand.get("pk")
+                    ):
                         user_info.update(cand)
 
             # 2. Cari timeline postingan
@@ -288,7 +364,7 @@ def fetch_instagram_posts(username: str, limit: int) -> tuple[list, str, str]:
     logger.info(f"Mengunduh dokumen web profil @{username}...")
     html_content = loader.context._get_page(loader.context._session, f"{username.lower()}/")
     
-    user_info, edges = universal_extract_posts(html_content)
+    user_info, edges = universal_extract_posts(html_content, username)
 
     full_name = user_info.get("full_name") or "Pengadilan Agama Sanggau"
     biography = user_info.get("biography") or f"Feed RSS postingan publik Instagram @{username}"
@@ -301,9 +377,11 @@ def fetch_instagram_posts(username: str, limit: int) -> tuple[list, str, str]:
     for edge in edges:
         node = edge.get("node", {})
         if node:
-            posts_data.append(parse_post_node(node))
-            if len(posts_data) >= limit:
-                break
+            hasil = parse_post_node(node)
+            if hasil:
+                posts_data.append(hasil)
+                if len(posts_data) >= limit:
+                    break
 
     # Jika butuh arsip postingan lebih banyak, coba panggil profile.get_posts()
     if len(posts_data) < limit:
@@ -328,6 +406,15 @@ def fetch_instagram_posts(username: str, limit: int) -> tuple[list, str, str]:
                     break
         except Exception as more_err:
             logger.warning(f"Arsip tambahan tidak tersedia ({more_err}), menggunakan {len(posts_data)} postingan utama.")
+
+    # Permintaan tambahan hanya untuk butir tanpa foto agar kuota tetap aman.
+    for item in posts_data:
+        if not item.get("image_url"):
+            item["image_url"] = ambil_gambar_embed(loader, item["shortcode"])
+            if item["image_url"]:
+                item["description_html"] = format_description_html(
+                    item.get("caption", ""), item["image_url"], item["link"]
+                )
 
     return posts_data, channel_title, channel_desc
 
