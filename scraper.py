@@ -2,10 +2,19 @@
 """
 Instagram to RSS 2.0 Generator
 Target: Akun Publik @pa.sanggau (Pengadilan Agama Sanggau)
+
+Fitur:
+- Universal Embedded JSON Parser: Menangkap struktur xdt_user_by_username,
+  xig_user_by_username, polaris_ordered_timeline_connection, maupun edge_owner_to_timeline_media.
+- Melewati login redirect di runner cloud (GitHub Actions) menggunakan session cookie.
+- Menghasilkan file rss.xml standar RSS 2.0 yang valid (UTF-8).
+- Atomic write: Menjamin berkas rss.xml lama tidak pernah rusak atau terhapus.
 """
 
 import os
+import re
 import sys
+import json
 import html
 import logging
 import tempfile
@@ -137,9 +146,13 @@ def parse_post_node(node: dict) -> dict:
     elif isinstance(caption_obj, str):
         caption = caption_obj
     else:
-        caption = ""
+        caption_edges = node.get("edge_media_to_caption", {}).get("edges", [])
+        if caption_edges and isinstance(caption_edges[0], dict):
+            caption = caption_edges[0].get("node", {}).get("text", "")
+        else:
+            caption = ""
 
-    # Konversi ID Snowflake Instagram ke waktu publikasi akurat
+    # Konversi ID Snowflake Instagram ke waktu publikasi RFC-822 yang akurat
     pk = node.get("pk")
     if pk:
         ts = ((int(pk) >> 23) + 1314220021794) / 1000.0
@@ -166,8 +179,71 @@ def parse_post_node(node: dict) -> dict:
     }
 
 
+def universal_extract_posts(html_text: str) -> tuple[dict, list]:
+    """
+    Ekstraksi rekursif universal dari seluruh script JSON di dalam HTML Instagram.
+    Mendukung format xdt_user_by_username, xig_user_by_username, polaris, maupun edge_owner.
+    """
+    scripts = re.findall(r'<script type=[\x22\x27]application/json[\x22\x27][^>]*>(.*?)</script>', html_text, re.DOTALL)
+    logger.info(f"Ditemukan {len(scripts)} blok data JSON tertanam di halaman.")
+
+    user_info = {}
+    edges = []
+
+    def recursive_search(obj):
+        nonlocal user_info, edges
+        if isinstance(obj, dict):
+            # 1. Cari data profil user
+            for u_key in ["xdt_user_by_username", "xig_user_by_username", "user"]:
+                if u_key in obj and isinstance(obj[u_key], dict):
+                    cand = obj[u_key]
+                    if cand.get("full_name") or cand.get("biography") or cand.get("pk"):
+                        user_info.update(cand)
+
+            # 2. Cari timeline postingan
+            for tl_key in ["polaris_ordered_timeline_connection", "edge_owner_to_timeline_media", "ordered_timeline_connection"]:
+                if tl_key in obj and isinstance(obj[tl_key], dict):
+                    tl = obj[tl_key]
+                    if "edges" in tl and isinstance(tl["edges"], list):
+                        for e in tl["edges"]:
+                            if isinstance(e, dict) and "node" in e:
+                                edges.append(e)
+
+            # 3. Cari jika obj sendiri adalah container edges
+            if "edges" in obj and isinstance(obj["edges"], list):
+                if obj["edges"] and isinstance(obj["edges"][0], dict):
+                    first_node = obj["edges"][0].get("node")
+                    if isinstance(first_node, dict) and ("code" in first_node or "shortcode" in first_node):
+                        edges.extend(obj["edges"])
+
+            for v in obj.values():
+                recursive_search(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                recursive_search(item)
+
+    for s in scripts:
+        try:
+            data = json.loads(s)
+            recursive_search(data)
+        except Exception:
+            continue
+
+    # Hapus duplikat postingan berdasarkan shortcode
+    unique_edges = []
+    seen_codes = set()
+    for e in edges:
+        node = e.get("node", {})
+        code = node.get("code") or node.get("shortcode")
+        if code and code not in seen_codes:
+            seen_codes.add(code)
+            unique_edges.append(e)
+
+    return user_info, unique_edges
+
+
 def fetch_instagram_posts(username: str, limit: int) -> tuple[list, str, str]:
-    logger.info(f"Menginisialisasi loader untuk profil @{username}...")
+    logger.info(f"Menginisialisasi request profil @{username}...")
     
     loader = instaloader.Instaloader(
         download_pictures=False,
@@ -181,9 +257,9 @@ def fetch_instagram_posts(username: str, limit: int) -> tuple[list, str, str]:
         quiet=True
     )
 
-    # Injeksi cookie ke sesi HTTP
+    # Injeksi cookie session
     if SESSION_ID:
-        logger.info("Session cookie terdeteksi. Memasang cookie ke sesi HTTP...")
+        logger.info("Session cookie terdeteksi. Memuat cookie autentikasi...")
         if "=" in SESSION_ID:
             for part in SESSION_ID.split(";"):
                 if "=" in part:
@@ -206,42 +282,33 @@ def fetch_instagram_posts(username: str, limit: int) -> tuple[list, str, str]:
     else:
         logger.info("Berjalan tanpa session cookie.")
 
-    # KUNCI UTAMA: Cegah Instaloader menghapus cookie session saat memanggil get_page_data
+    # Override get_anonymous_session agar cookie sesi tidak dihapus
     loader.context.get_anonymous_session = lambda: loader.context._session
 
-    logger.info(f"Mengambil halaman web profil publik @{username}...")
-    page_data = loader.context.get_page_data(f"{username.lower()}/")
+    logger.info(f"Mengunduh dokumen web profil @{username}...")
+    html_content = loader.context._get_page(loader.context._session, f"{username.lower()}/")
+    
+    user_info, edges = universal_extract_posts(html_content)
 
-    channel_title = f"Pengadilan Agama Sanggau (@{username}) - Instagram"
-    channel_desc = f"Feed RSS postingan publik Instagram @{username}"
+    full_name = user_info.get("full_name") or "Pengadilan Agama Sanggau"
+    biography = user_info.get("biography") or f"Feed RSS postingan publik Instagram @{username}"
+    channel_title = f"{full_name} (@{username}) - Instagram"
+    channel_desc = biography
 
-    embedded_edges = []
-    for data in page_data:
-        if "xig_user_by_username" in data:
-            u_info = data["xig_user_by_username"]
-            if u_info.get("full_name"):
-                channel_title = f"{u_info.get('full_name')} (@{username}) - Instagram"
-            if u_info.get("biography"):
-                channel_desc = u_info.get("biography")
-            
-            timeline = u_info.get("polaris_ordered_timeline_connection")
-            if timeline and "edges" in timeline:
-                embedded_edges.extend(timeline["edges"])
+    logger.info(f"Profil: '{full_name}'. Ditemukan {len(edges)} postingan di halaman web.")
 
     posts_data = []
-    for edge in embedded_edges:
+    for edge in edges:
         node = edge.get("node", {})
         if node:
             posts_data.append(parse_post_node(node))
             if len(posts_data) >= limit:
                 break
 
-    logger.info(f"Berhasil mengekstrak {len(posts_data)} postingan terbaru dari profil @{username}.")
-
-    # Jika limit lebih besar dan didukung, coba ambil postingan arsip tambahan
+    # Jika butuh arsip postingan lebih banyak, coba panggil profile.get_posts()
     if len(posts_data) < limit:
         try:
-            logger.info("Mencoba mengambil postingan arsip tambahan...")
+            logger.info("Mencoba mengambil arsip postingan lanjutan...")
             profile = instaloader.Profile.from_username(loader.context, username)
             for p in profile.get_posts():
                 if any(item["shortcode"] == p.shortcode for item in posts_data):
@@ -260,7 +327,7 @@ def fetch_instagram_posts(username: str, limit: int) -> tuple[list, str, str]:
                 if len(posts_data) >= limit:
                     break
         except Exception as more_err:
-            logger.warning(f"Arsip lanjutan tidak dapat dimuat ({more_err}), menggunakan {len(posts_data)} postingan utama.")
+            logger.warning(f"Arsip tambahan tidak tersedia ({more_err}), menggunakan {len(posts_data)} postingan utama.")
 
     return posts_data, channel_title, channel_desc
 
